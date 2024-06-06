@@ -1,9 +1,13 @@
 import uuid
-from django.db import models
+import logging
+from django.db import models, transaction
 from django.urls import reverse
 from django.conf import settings
 from django.utils import timezone
 from django.core.exceptions import ValidationError 
+from django.core.mail import send_mail
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from djmoney.models.fields import MoneyField
 
 
@@ -61,9 +65,9 @@ class Item(models.Model):
     name = models.CharField(max_length=255, verbose_name="Nom")
     specification = models.CharField(max_length=255, verbose_name="Spécification")
     code = models.CharField(max_length=190, unique=True, verbose_name="Code")
-    Category = models.ForeignKey(Category, on_delete=models.CASCADE)
+    category = models.ForeignKey(Category, on_delete=models.CASCADE)
     supplier = models.ManyToManyField(Supplier, verbose_name="Fournisseurs")
-    unit_of_measure = models.ForeignKey(UnitOfMeasure, on_delete=models.PROTECT, verbose_name="Unité de mesure")
+    base_unit = models.ForeignKey(UnitOfMeasure, on_delete=models.PROTECT, related_name="base_items", verbose_name="Unité de base")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Créé le")
     modified_at = models.DateTimeField(auto_now=True, verbose_name="Modifié le")
 
@@ -75,49 +79,59 @@ class Item(models.Model):
     def __str__(self):
         return self.name
 
-
-class ItemUnit(models.Model):
-    """Association entre un article et une unité de mesure, avec un facteur de conversion."""
-    item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name="units")
+class ItemConversion(models.Model):
+    """Facteurs de conversion pour les unités d'un article."""
+    item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name="conversions")
     unit = models.ForeignKey(UnitOfMeasure, on_delete=models.CASCADE)
     conversion_factor = models.DecimalField(max_digits=10, decimal_places=5, verbose_name="Facteur de conversion")
-    is_base_unit = models.BooleanField(default=False, verbose_name="Unité de base")
-    base_unit_quantity = models.DecimalField(max_digits=10, decimal_places=5, null=True, blank=True, verbose_name="Quantité dans l'unité de base")
 
     class Meta:
         unique_together = ('item', 'unit')
-        verbose_name = "Unité d'article"
-        verbose_name_plural = "Unités d'articles"
+        verbose_name = "Conversion d'unité d'article"
+        verbose_name_plural = "Conversions d'unités d'articles"
 
     def __str__(self):
-        return f"{self.item} en {self.unit} (facteur: {self.conversion_factor})"
-    
-    def save(self, *args, **kwargs):
-        # Vérifier si c'est l'unité de base
-        if self.is_base_unit:
-            self.base_unit_quantity = 1  # L'unité de base a un facteur de conversion de 1 par rapport à elle-même
-        elif self.base_unit_quantity is None:
-            # Calculer la quantité dans l'unité de base si ce n'est pas l'unité de base
-            base_unit = self.item.units.get(is_base_unit=True)
-            self.base_unit_quantity = self.conversion_factor * base_unit.conversion_factor
-
-        super().save(*args, **kwargs)
+        return f"{self.item} - {self.unit} (facteur: {self.conversion_factor})"
 
 
 
 class Stock(models.Model):
     """Quantité d'un produit dans un entrepôt."""
     warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE, verbose_name="Entrepôt")
-    item_unit = models.ForeignKey(ItemUnit, on_delete=models.CASCADE, verbose_name="Article et unité")
-    quantity = models.PositiveIntegerField(default=0, verbose_name="Quantité")
+    item = models.ForeignKey(Item, on_delete=models.CASCADE, verbose_name="Article")
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name="Quantité")
+    allow_negative = models.BooleanField(default=False, verbose_name="Autoriser quantité négative")
+    negative_authorized_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Autorisé par"
+    )
 
     class Meta:
-        unique_together = ('warehouse', 'item_unit')
+        unique_together = ('warehouse', 'item')
         verbose_name = "Stock"
         verbose_name_plural = "Stocks"
 
     def __str__(self):
-        return f"{self.quantity} {self.item_unit.unit} de {self.item_unit.item} dans {self.warehouse}"
+        return f"{self.quantity} {self.item.base_unit} de {self.item} dans {self.warehouse}"
+    
+    def clean(self):
+        if self.quantity < 0 and not self.allow_negative:
+            raise ValidationError("La quantité en stock ne peut pas être négative sans autorisation.")
+
+
+class StockAdjustment(models.Model):
+    stock = models.ForeignKey(Stock, on_delete=models.CASCADE)
+    adjustment_type = models.CharField(max_length=50, choices=[
+        ('order_fulfillment', 'Exécution de commande'),
+        ('stock_transfer', 'Transfert de stock'),
+        ('damage', 'Dommage'),
+        ('other', 'Autre'),
+    ])
+    quantity = models.DecimalField(max_digits=10, decimal_places=2)
+    timestamp = models.DateTimeField(auto_now_add=True)
 
 
 class Order(models.Model):
@@ -186,7 +200,7 @@ class Order(models.Model):
 class OrderItem(models.Model):
     """Ligne d'une commande, détaille les articles commandés."""
     order = models.ForeignKey(Order, on_delete=models.CASCADE, verbose_name="Commande")
-    item_unit = models.ForeignKey(ItemUnit, on_delete=models.CASCADE, verbose_name="Article et unité")
+    item_unit = models.ForeignKey(Item, on_delete=models.CASCADE, verbose_name="Article et unité")
     quantity = models.DecimalField(max_digits=19, decimal_places=2, verbose_name="Quantité")
     unit_price = MoneyField(max_digits=14, decimal_places=2, default_currency='USD', verbose_name="Prix unitaire")
 
@@ -217,8 +231,6 @@ class Carrier(models.Model):
 
     def __str__(self):
         return self.name
-
-
 
 
 class TransportMode(models.Model):
@@ -364,6 +376,51 @@ class StockTransfer(models.Model):
                 raise ValidationError(f"Erreur lors de la mise à jour des stocks pour l'article '{self.item}'.")
 
         super().save(*args, **kwargs)
+
+logger = logging.getLogger(__name__)
+
+@receiver(post_save, sender=StockTransfer)
+def update_stock_on_transfer_approval(sender, instance, **kwargs):
+    if instance.status == StockTransfer.STATUS_APPROVED and not instance.approved_at:
+        instance.approved_at = timezone.now()
+
+        with transaction.atomic():
+            try:
+                from_stock = Stock.objects.select_for_update().get(warehouse=instance.from_warehouse, item=instance.item)
+                to_stock, created = Stock.objects.select_for_update().get_or_create(warehouse=instance.to_warehouse, item=instance.item)
+
+                if from_stock.quantity - instance.quantity < 0:
+                    if not from_stock.allow_negative:
+                        raise ValidationError(f"Le transfert entraînerait une quantité négative pour l'article '{instance.item}' dans l'entrepôt source. Veuillez autoriser les quantités négatives ou ajuster la quantité du transfert.")
+                    else:
+                        # Envoyer une notification pour la quantité négative autorisée
+                        send_mail(
+                            "Quantité négative autorisée pour un transfert de stock",
+                            f"Un transfert de stock a été approuvé avec une quantité négative pour l'article '{instance.item}' dans l'entrepôt '{instance.from_warehouse.name}'.",
+                            settings.DEFAULT_FROM_EMAIL,
+                            [admin[1] for admin in settings.ADMINS],  # Envoyer aux administrateurs
+                            fail_silently=False,
+                        )
+
+                from_stock.quantity -= instance.quantity
+                to_stock.quantity += instance.quantity
+
+                from_stock.save()
+                to_stock.save()
+
+                # Envoyer une notification pour le transfert approuvé
+                send_mail(
+                    "Transfert de stock approuvé",
+                    f"Un transfert de {instance.quantity} x {instance.item} de {instance.from_warehouse.name} vers {instance.to_warehouse.name} a été approuvé.",
+                    settings.DEFAULT_FROM_EMAIL,
+                    [instance.approved_by.email],  # Envoyer à l'utilisateur qui a approuvé
+                    fail_silently=False,
+                )
+
+                logger.info(f"Transfert de stock approuvé : {instance.quantity} x {instance.item} de {instance.from_warehouse} vers {instance.to_warehouse}")
+
+            except Stock.DoesNotExist:
+                raise ValidationError(f"Erreur lors de la mise à jour des stocks pour l'article '{instance.item}'.")
 
 
 class Machine(models.Model):
